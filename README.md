@@ -2,6 +2,8 @@
 
 A comprehensive Python script for debugging and analyzing HTML files. It detects common issues, validates structure, and provides detailed reports.
 
+**Coded by danewbreed**
+
 ## Features
 
 ✅ **Structure Validation**
