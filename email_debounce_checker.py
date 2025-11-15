@@ -11,6 +11,9 @@ import socket
 from typing import Dict, List, Tuple
 from email.utils import parseaddr
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
+from functools import partial
 
 class EmailDebounceChecker:
     """Check if email addresses are valid and deliverable"""
@@ -141,13 +144,101 @@ class EmailDebounceChecker:
         result['valid'] = syntax_valid and dns_valid and (result['smtp_valid'] if verify_smtp else True)
         
         return result
-    
-    def check_bulk(self, emails: List[str], verify_smtp: bool = False) -> List[Dict]:
-        """Check multiple emails"""
-        results = []
-        for email in emails:
+
+    def check_email_with_timeout(self, email: str, verify_smtp: bool = False) -> Dict:
+        """Check email with timeout handling"""
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Email check timed out")
+
+        # Set up timeout signal
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(self.timeout * 2)  # Give extra time for cleanup
+
+        try:
             result = self.check_email(email, verify_smtp)
-            results.append(result)
+            return result
+        except TimeoutError:
+            return {
+                'email': email.strip().lower(),
+                'valid': False,
+                'syntax_valid': False,
+                'dns_valid': False,
+                'smtp_valid': None,
+                'details': {'syntax': 'Check timed out'},
+                'errors': ['Check timed out']
+            }
+        except Exception as e:
+            return {
+                'email': email.strip().lower(),
+                'valid': False,
+                'syntax_valid': False,
+                'dns_valid': False,
+                'smtp_valid': None,
+                'details': {'syntax': f'Unexpected error: {str(e)}'},
+                'errors': [f'Unexpected error: {str(e)}']
+            }
+        finally:
+            # Restore original signal handler and cancel alarm
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+
+    def check_bulk(self, emails: List[str], verify_smtp: bool = False, concurrency: int = 10, batch_size: int = 100, delay: float = 0.0) -> List[Dict]:
+        """Check multiple emails with progress tracking and parallel processing"""
+        total_emails = len(emails)
+        results = [None] * total_emails  # Pre-allocate results list
+        start_time = time.time()
+
+        print(f"\nChecking {total_emails} email(s) with {concurrency} concurrent threads...")
+        if verify_smtp:
+            print("⚠ SMTP verification enabled (this may take longer)")
+        print(f"Progress updates every {batch_size} emails\n")
+
+        # Process in batches for progress tracking
+        for batch_start in range(0, total_emails, batch_size):
+            batch_end = min(batch_start + batch_size, total_emails)
+            batch_emails = emails[batch_start:batch_end]
+
+            # Process batch with parallel threads
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                # Submit all tasks for this batch
+                future_to_index = {
+                    executor.submit(self.check_email_with_timeout, email, verify_smtp): batch_start + i
+                    for i, email in enumerate(batch_emails)
+                }
+
+                # Collect results as they complete
+                for future in as_completed(future_to_index):
+                    index = future_to_index[future]
+                    try:
+                        results[index] = future.result()
+                    except Exception as e:
+                        # Handle any unexpected errors
+                        email = emails[index]
+                        results[index] = {
+                            'email': email.strip().lower(),
+                            'valid': False,
+                            'syntax_valid': False,
+                            'dns_valid': False,
+                            'smtp_valid': None,
+                            'details': {'syntax': f'Processing error: {str(e)}'},
+                            'errors': [f'Processing error: {str(e)}']
+                        }
+
+            # Progress update
+            processed = batch_end
+            elapsed = time.time() - start_time
+            rate = processed / elapsed if elapsed > 0 else 0
+            eta = (total_emails - processed) / rate if rate > 0 else 0
+
+            print(f"Progress: {processed}/{total_emails} emails processed "
+                  f"({processed/total_emails*100:.1f}%) - "
+                  f"Rate: {rate:.1f} emails/sec - "
+                  f"ETA: {eta:.0f} seconds")
+
+            # Optional delay between batches
+            if delay > 0 and batch_end < total_emails:
+                time.sleep(delay)
+
         return results
 
 
@@ -199,6 +290,9 @@ Examples:
     parser.add_argument('--smtp', action='store_true', help='Enable SMTP verification (slower)')
     parser.add_argument('--timeout', type=int, default=10, help='Timeout in seconds (default: 10)')
     parser.add_argument('--json', action='store_true', help='Output results in JSON format')
+    parser.add_argument('--concurrency', type=int, default=10, help='Number of concurrent threads (default: 10)')
+    parser.add_argument('--batch-size', type=int, default=100, help='Batch size for progress updates (default: 100)')
+    parser.add_argument('--delay', type=float, default=0.0, help='Delay between batches in seconds (default: 0.0)')
     
     args = parser.parse_args()
     
@@ -225,11 +319,13 @@ Examples:
     checker = EmailDebounceChecker(timeout=args.timeout)
     
     # Check emails
-    print(f"\nChecking {len(emails)} email(s)...")
-    if args.smtp:
-        print("⚠ SMTP verification enabled (this may take longer)")
-    
-    results = checker.check_bulk(emails, verify_smtp=args.smtp)
+    results = checker.check_bulk(
+        emails,
+        verify_smtp=args.smtp,
+        concurrency=args.concurrency,
+        batch_size=args.batch_size,
+        delay=args.delay
+    )
     
     # Output results
     if args.json:
